@@ -1,52 +1,34 @@
 package main
 
 import (
-	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
-	"strconv"
-	"time"
+	"net/url"
 
-	"github.com/golang-jwt/jwt/v5"
+	// "net/url"
+
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{}
 var socketDirector = NewSocketManager()
 
-var secretKey string
+func echo(w http.ResponseWriter, r *http.Request) {
 
-func verifyKey(keyString string) (*jwt.Token, error) {
-	key, err := jwt.Parse(keyString, func(k *jwt.Token) (interface{}, error) {
-		return secretKey, nil
-	})
+	connId := "632913"
+	queryParams, err := url.ParseQuery(r.URL.RawQuery)
 
 	if err != nil {
-		return nil, err
+		http.Error(w, "Unable to parse query", http.StatusBadRequest)
+		return
 	}
 
-	if !key.Valid {
-		return nil, fmt.Errorf("Invalid token")
+	channel, ok := queryParams["channel"]
+
+	if !ok {
+		http.Error(w, "Must have a channel as a query param", http.StatusBadRequest)
+		return
 	}
-
-	return key, nil
-}
-
-func generateRandomID() string {
-	// Seed the random number generator
-	rand.Seed(time.Now().UnixNano())
-
-	// Generate a random integer
-	randomInt := rand.Intn(1000000) // Generates a random integer between 0 and 999999
-
-	// Convert the integer to a string
-	randomID := strconv.Itoa(randomInt)
-
-	return randomID
-}
-
-func echo(w http.ResponseWriter, r *http.Request) {
 
 	c, err := upgrader.Upgrade(w, r, nil)
 
@@ -57,9 +39,8 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.Close()
 
-	connId :=  "632913"
-	socketDirector.Track("sf", connId,c)
-	defer socketDirector.Untrack("sf", connId, c)
+	socketDirector.StartTracking(channel[0], connId, c)
+	defer socketDirector.StopTracking(channel[0], connId, c)
 
 	for {
 		_, _, err := c.ReadMessage()
