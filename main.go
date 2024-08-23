@@ -11,7 +11,7 @@ import (
 )
 
 var upgrader = websocket.Upgrader{}
-var socketDirector = NewSocketManager()
+var socketDirector = NewBroadcaster()
 
 func echo(w http.ResponseWriter, r *http.Request) {
 
