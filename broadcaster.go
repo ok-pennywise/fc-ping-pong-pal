@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"slices"
 	"sync"
 
@@ -11,30 +12,28 @@ import (
 )
 
 type Broadcaster struct {
-	redisConn *redis.Client
+	redisClient *redis.Client
 
 	mx *sync.Mutex
-	wg *sync.WaitGroup
 
-	sockets      map[string]map[string][]*websocket.Conn
+	messageChannel chan *redis.Message
+
+	sockets           map[string]map[string][]*websocket.Conn
+	stopReadingSignal map[string]chan bool
+
 	totalSockets int
-
-	channelContexts map[string]*context.CancelFunc
-
-	interComm chan *redis.Message
 }
 
 func NewBroadcaster() *Broadcaster {
 	b := &Broadcaster{
-		redisConn:       redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
-		sockets:         make(map[string]map[string][]*websocket.Conn),
-		totalSockets:    0,
-		channelContexts: make(map[string]*context.CancelFunc),
-		interComm:       make(chan *redis.Message, 512),
-		mx:              &sync.Mutex{},
-		wg:              &sync.WaitGroup{},
+		redisClient:       redis.NewClient(&redis.Options{Addr: "localhost:6379"}), // Default Redis port is 6379
+		mx:                &sync.Mutex{},
+		messageChannel:    make(chan *redis.Message),
+		sockets:           make(map[string]map[string][]*websocket.Conn),
+		stopReadingSignal: map[string]chan bool{},
+		totalSockets:      0,
 	}
-	b.startBroadcasting()
+	go b.broadcast()
 	return b
 }
 
@@ -45,132 +44,112 @@ func (b *Broadcaster) StartTracking(channel, connId string, conn *websocket.Conn
 	if _, ok := b.sockets[channel]; !ok {
 		b.sockets[channel] = make(map[string][]*websocket.Conn)
 	}
-
 	b.sockets[channel][connId] = append(b.sockets[channel][connId], conn)
 
-	if _, ok := b.channelContexts[channel]; !ok {
-		subscriber := b.redisConn.Subscribe(context.Background(), channel)
-		ctx, cancel := context.WithCancel(context.Background())
-		b.channelContexts[channel] = &cancel
-		go b.readMessage(ctx, subscriber)
+	if _, ok := b.stopReadingSignal[channel]; !ok {
+		subscriber := b.redisClient.Subscribe(context.Background(), channel)
+		go b.readMessage(b.stopReadingSignal[channel], subscriber)
 	}
 
-	b.totalSockets += 1
-	log.Printf("New client added. Client count: %d", b.totalSockets)
+	b.totalSockets++
+	log.Println("", b.sockets)
 }
 
 func (b *Broadcaster) StopTracking(channel, connId string, conn *websocket.Conn) {
 	b.mx.Lock()
 	defer b.mx.Unlock()
 
-	if socketsByChannel, ok := b.sockets[channel]; ok {
-		// Retrieve the slice of connections for the given connId
-		sockets := socketsByChannel[connId]
-
-		// Create a new slice to hold the remaining connections
-		// Iterate over the existing slice and append only the connections that do not match the one being removed
-		for i, socket := range sockets {
+	if conns, ok := b.sockets[channel][connId]; ok {
+		for i, socket := range conns {
 			if socket == conn {
-				b.sockets[channel][connId] = slices.Delete(b.sockets[channel][connId], i, i+1)
+				b.sockets[channel][connId] = slices.Delete(conns, i, i+1)
 				break
 			}
 		}
+	}
 
-		if len(b.sockets[channel][connId]) == 0 {
-			delete(b.sockets[channel], connId)
-		}
+	if len(b.sockets[channel][connId]) == 0 {
+		delete(b.sockets[channel], connId)
+	}
 
-		// Clean up the channel if there are no connections left
-		if len(b.sockets[channel]) == 0 {
-			delete(b.sockets, channel)
-			if cancelGoRoutine, ok := b.channelContexts[channel]; ok {
-				(*cancelGoRoutine)()
-				delete(b.channelContexts, channel)
-			}
+	if len(b.sockets[channel]) == 0 {
+		delete(b.sockets, channel)
+		if stopSignal, ok := b.stopReadingSignal[channel]; ok {
+			stopSignal <- true
 		}
 	}
 
 	if b.totalSockets > 0 {
-		b.totalSockets -= 1
+		b.totalSockets--
 	}
-
-	log.Printf("New client removed. Client count: %d", b.totalSockets)
+	log.Println("", b.sockets)
 }
 
-func (b *Broadcaster) SwitchChannel(connId, oldChannel, newChannel string) {
-	b.mx.Lock()
-	defer b.mx.Unlock()
-
-	if sockets, ok := b.sockets[oldChannel][connId]; ok {
-		delete(b.sockets[oldChannel], connId)
-
-		if _, ok := b.sockets[newChannel]; !ok {
-			b.sockets[newChannel] = make(map[string][]*websocket.Conn)
-		}
-
-		b.sockets[newChannel][connId] = append(b.sockets[newChannel][connId], sockets...)
-	}
-}
-
-func (b *Broadcaster) readMessage(ctx context.Context, subscriber *redis.PubSub) {
+func (b *Broadcaster) readMessage(stopReadingSignal chan bool, subscriber *redis.PubSub) {
 	for {
 		select {
-		case <-ctx.Done():
-			subscriber.Close()
+		case <-stopReadingSignal:
+			log.Println("Go routine closed")
 			return
 		default:
 			message, err := subscriber.ReceiveMessage(context.Background())
 			if err != nil {
-				log.Println("Error receiving message:", err)
+				log.Println("Unable to read messages from Redis:", err)
 				return
 			}
-			b.interComm <- message
+			b.messageChannel <- message
 		}
 	}
 }
 
-func (b *Broadcaster) broadcastMessage() {
-	for message := range b.interComm {
+func (b *Broadcaster) broadcast() {
+	for message := range b.messageChannel {
 		b.mx.Lock()
-
 		socketsByChannel, ok := b.sockets[message.Channel]
+		b.mx.Unlock()
 		if !ok {
-			b.mx.Unlock()
 			continue
 		}
-
-		// Create a wait group to wait for all go routines to finish
-
-		// Split sockets into chunks
-		socketsSlice := make([]*websocket.Conn, 0)
-		for _, connList := range socketsByChannel {
-			socketsSlice = append(socketsSlice, connList...)
-		}
-
-		batchSize := 100
-		for i := 0; i < len(socketsSlice); i += batchSize {
-			end := i + batchSize
-			if end > len(socketsSlice) {
-				end = len(socketsSlice)
-			}
-
-			// Launch a go routine for each batch
-			b.wg.Add(1)
-			go func(start, end int) {
-				defer b.wg.Done()
-				for _, socket := range socketsSlice[start:end] {
-					if err := socket.WriteMessage(websocket.TextMessage, []byte(message.Payload)); err != nil {
-						log.Println("Error sending message:", err)
-					}
+		for _, socketsByConnId := range socketsByChannel {
+			for _, socket := range socketsByConnId {
+				err := socket.WriteMessage(websocket.TextMessage, []byte(message.Payload))
+				if err != nil {
+					log.Println("Failed to send message to WebSocket:", err)
 				}
-			}(i, end)
+			}
 		}
-
-		b.mx.Unlock()
-		b.wg.Wait() // Wait for all go routines to finish
 	}
 }
 
-func (b *Broadcaster) startBroadcasting() {
-	go b.broadcastMessage()
+var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+var broadcaster = NewBroadcaster()
+
+func echo(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("Unable to upgrade")
+	}
+	defer conn.Close()
+
+	id := "314323"
+	broadcaster.StartTracking("sf", id, conn)
+	defer broadcaster.StopTracking("sf", id, conn)
+
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+				log.Println("Connection closed normally")
+				return
+			}
+			log.Println("Error reading message:", err)
+			return
+		}
+	}
+
+}
+
+func main() {
+	http.HandleFunc("/", echo)
+	http.ListenAndServe(":8000", nil)
 }
