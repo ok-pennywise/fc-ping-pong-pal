@@ -18,20 +18,17 @@ type Broadcaster struct {
 
 	messageChannel chan *redis.Message
 
-	sockets           map[string]map[string][]*websocket.Conn
-	stopReadingSignal map[string]chan bool
-
-	totalSockets int
+	sockets        map[string]map[string][]*websocket.Conn
+	channelContext map[string]context.CancelFunc
 }
 
 func NewBroadcaster() *Broadcaster {
 	b := &Broadcaster{
-		redisClient:       redis.NewClient(&redis.Options{Addr: "localhost:6379"}), // Default Redis port is 6379
-		mx:                &sync.Mutex{},
-		messageChannel:    make(chan *redis.Message),
-		sockets:           make(map[string]map[string][]*websocket.Conn),
-		stopReadingSignal: map[string]chan bool{},
-		totalSockets:      0,
+		redisClient:    redis.NewClient(&redis.Options{Addr: "localhost:6379"}), // Default Redis port is 6379
+		mx:             &sync.Mutex{},
+		messageChannel: make(chan *redis.Message, 1024),
+		sockets:        make(map[string]map[string][]*websocket.Conn),
+		channelContext: make(map[string]context.CancelFunc),
 	}
 	go b.broadcast()
 	return b
@@ -46,12 +43,12 @@ func (b *Broadcaster) StartTracking(channel, connId string, conn *websocket.Conn
 	}
 	b.sockets[channel][connId] = append(b.sockets[channel][connId], conn)
 
-	if _, ok := b.stopReadingSignal[channel]; !ok {
-		subscriber := b.redisClient.Subscribe(context.Background(), channel)
-		go b.readMessage(b.stopReadingSignal[channel], subscriber)
+	if _, ok := b.channelContext[channel]; !ok {
+		ctx, cancel := context.WithCancel(context.Background())
+		b.channelContext[channel] = cancel
+		subscriber := b.redisClient.Subscribe(ctx, channel)
+		go b.readMessage(ctx, subscriber)
 	}
-
-	b.totalSockets++
 	log.Println("", b.sockets)
 }
 
@@ -74,30 +71,33 @@ func (b *Broadcaster) StopTracking(channel, connId string, conn *websocket.Conn)
 
 	if len(b.sockets[channel]) == 0 {
 		delete(b.sockets, channel)
-		if stopSignal, ok := b.stopReadingSignal[channel]; ok {
-			stopSignal <- true
+		if cancelFunc, ok := b.channelContext[channel]; ok {
+			cancelFunc()                      // Cancel the context to stop the goroutine
+			delete(b.channelContext, channel) // Clean up the map
 		}
 	}
 
-	if b.totalSockets > 0 {
-		b.totalSockets--
-	}
 	log.Println("", b.sockets)
 }
 
-func (b *Broadcaster) readMessage(stopReadingSignal chan bool, subscriber *redis.PubSub) {
+func (b *Broadcaster) readMessage(ctx context.Context, subscriber *redis.PubSub) {
+	ch := subscriber.Channel()
 	for {
 		select {
-		case <-stopReadingSignal:
-			log.Println("Go routine closed")
+		case <-ctx.Done():
+			log.Println("Context canceled, stopping readMessage")
 			return
-		default:
-			message, err := subscriber.ReceiveMessage(context.Background())
-			if err != nil {
-				log.Println("Unable to read messages from Redis:", err)
+		case message, ok := <-ch:
+			if !ok {
+				log.Println("Channel closed")
 				return
 			}
-			b.messageChannel <- message
+			select {
+			case b.messageChannel <- message:
+			case <-ctx.Done():
+				log.Println("Context canceled during message send")
+				return
+			}
 		}
 	}
 }
@@ -128,6 +128,7 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("Unable to upgrade")
+		return
 	}
 	defer conn.Close()
 
@@ -138,15 +139,12 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				log.Println("Connection closed normally")
-				return
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+				log.Println("Error reading message:", err)
 			}
-			log.Println("Error reading message:", err)
-			return
+			break
 		}
 	}
-
 }
 
 func main() {
