@@ -19,7 +19,9 @@ type Broadcaster struct {
 	messageChannel chan *redis.Message
 
 	sockets        map[string]map[string][]*websocket.Conn
-	channelContext map[string]context.CancelFunc
+	channelContext map[string]*context.CancelFunc
+
+	totalSockets int
 }
 
 func NewBroadcaster() *Broadcaster {
@@ -28,7 +30,8 @@ func NewBroadcaster() *Broadcaster {
 		mx:             &sync.Mutex{},
 		messageChannel: make(chan *redis.Message, 1024),
 		sockets:        make(map[string]map[string][]*websocket.Conn),
-		channelContext: make(map[string]context.CancelFunc),
+		channelContext: make(map[string]*context.CancelFunc),
+		totalSockets:   0,
 	}
 	go b.broadcast()
 	return b
@@ -45,11 +48,12 @@ func (b *Broadcaster) StartTracking(channel, connId string, conn *websocket.Conn
 
 	if _, ok := b.channelContext[channel]; !ok {
 		ctx, cancel := context.WithCancel(context.Background())
-		b.channelContext[channel] = cancel
+		b.channelContext[channel] = &cancel
 		subscriber := b.redisClient.Subscribe(ctx, channel)
 		go b.readMessage(ctx, subscriber)
 	}
-	log.Println("", b.sockets)
+
+	b.totalSockets++
 }
 
 func (b *Broadcaster) StopTracking(channel, connId string, conn *websocket.Conn) {
@@ -72,12 +76,14 @@ func (b *Broadcaster) StopTracking(channel, connId string, conn *websocket.Conn)
 	if len(b.sockets[channel]) == 0 {
 		delete(b.sockets, channel)
 		if cancelFunc, ok := b.channelContext[channel]; ok {
-			cancelFunc()                      // Cancel the context to stop the goroutine
+			(*cancelFunc)()                   // Cancel the context to stop the goroutine
 			delete(b.channelContext, channel) // Clean up the map
 		}
 	}
 
-	log.Println("", b.sockets)
+	if b.totalSockets > 0 {
+		b.totalSockets--
+	}
 }
 
 func (b *Broadcaster) readMessage(ctx context.Context, subscriber *redis.PubSub) {
@@ -85,7 +91,8 @@ func (b *Broadcaster) readMessage(ctx context.Context, subscriber *redis.PubSub)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Context canceled, stopping readMessage")
+			log.Println("Unsubscribed")
+			subscriber.Unsubscribe(ctx)
 			return
 		case message, ok := <-ch:
 			if !ok {
