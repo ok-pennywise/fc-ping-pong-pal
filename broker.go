@@ -114,23 +114,34 @@ func (b *Broker) BroadcastMessage(ctx context.Context, channel string) {
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("Stopped broadcasting for %s", channel)
 			return
 		case msg := <-b.Intercom:
 			b.mx.RLock()
 			connsByChannel := b.Conns[msg.Channel]
 			b.mx.RUnlock()
-			
+
 			log.Println(connsByChannel)
-			for _, recipient := range msg.Recipients {
-				if conns, ok := connsByChannel[recipient]; ok {
+			if len(msg.Recipients) != 0 {
+				for _, recipient := range msg.Recipients {
+					if conns, ok := connsByChannel[recipient]; ok {
+						for _, conn := range conns {
+							if err := conn.WriteJSON(msg); err != nil {
+								log.Printf("Error sending message to WebSocket: %v", err)
+							}
+						}
+					}
+				}
+			} else {
+				for _, conns := range connsByChannel {
 					for _, conn := range conns {
 						if err := conn.WriteJSON(msg); err != nil {
 							log.Printf("Error sending message to WebSocket: %v", err)
-							// Handle disconnection if needed
 						}
 					}
 				}
 			}
+
 		}
 	}
 }
